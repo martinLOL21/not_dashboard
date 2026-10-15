@@ -2,138 +2,324 @@ import streamlit as st
 from influxdb_client import InfluxDBClient
 import pandas as pd
 import plotly.express as px
+import plotly.graph_objects as go
+from datetime import datetime, timedelta, timezone
 
 # ---------------------------
-# CONFIG
+# CONFIGURACIÓN
 # ---------------------------
 url = "https://us-east-1-1.aws.cloud2.influxdata.com"
-token = "5FESPQw5t4qA4GgZmyeZ9mu7u1sbtauo4Hh8tjRi1E8sdrIgzXAX5ESk4n5MmcpAjJWEGgEKklFX0LNasnUmng=="
+
+# Recomendado: guardar las credenciales en .streamlit/secrets.toml
+token = st.secrets["influxdb"]["token"]
 org = "miguelcmo"
 bucket = "iot_telemetry_data"
 
 # ---------------------------
 # STREAMLIT UI
 # ---------------------------
-st.set_page_config(page_title="IoT Dashboard", layout="wide")
-
-st.title("🌡️ IoT Telemetry Dashboard")
-st.markdown("Monitoreo de temperatura y humedad en tiempo real")
-
-# Sidebar
-st.sidebar.header("Configuración")
-
-time_range = st.sidebar.selectbox(
-    "Rango de tiempo",
-    ["-1h", "-6h", "-12h", "-24h", "-7d"],
-    index=3
+st.set_page_config(
+    page_title="IoT Dashboard",
+    page_icon="🌡️",
+    layout="wide"
 )
 
-refresh = st.sidebar.slider("Auto-refresh (segundos)", 0, 60, 10)
+st.title("🌡️ IoT Telemetry Dashboard")
+st.markdown(
+    "Monitoreo interactivo de temperatura y humedad"
+)
+
+st.sidebar.header("Configuración")
+
+# Seleccionar cuántas horas hacia atrás se quieren consultar
+rango_horas = st.sidebar.slider(
+    "Rango de horas (hacia atrás desde ahora)",
+    min_value=1,
+    max_value=168,
+    value=(0, 24),
+    help="Selecciona el intervalo temporal. "
+         "El extremo derecho representa las horas más recientes."
+)
+
+# El slider puede comenzar en 0 para representar el momento actual.
+# Se interpreta como: desde hace N horas hasta hace M horas.
+horas_recientes, horas_antiguas = rango_horas
+
+# Evitar un intervalo de cero horas
+if horas_recientes == horas_antiguas:
+    st.sidebar.warning("Selecciona un intervalo de tiempo válido.")
+
+# Resolución de las gráficas
+resolucion = st.sidebar.selectbox(
+    "Agrupar datos por",
+    ["1 hora", "30 minutos", "10 minutos"],
+    index=0
+)
+
+intervalos = {
+    "1 hora": "1h",
+    "30 minutos": "30min",
+    "10 minutos": "10min"
+}
+
+# Actualización automática
+refresh = st.sidebar.slider(
+    "Auto-refresh (segundos)",
+    min_value=0,
+    max_value=60,
+    value=10
+)
 
 # ---------------------------
-# DATA FUNCTION
+# CONSULTA A INFLUXDB
 # ---------------------------
 @st.cache_data(ttl=10)
-def load_data(time_range):
-    client = InfluxDBClient(url=url, token=token, org=org)
-    query_api = client.query_api()
+def load_data(start_iso, end_iso):
+    with InfluxDBClient(
+        url=url,
+        token=token,
+        org=org
+    ) as client:
 
-    query = f'''
-    from(bucket: "{bucket}")
-      |> range(start: {time_range})
-      |> filter(fn: (r) => r["_field"] == "temperature" or r["_field"] == "humidity")
-      |> pivot(rowKey:["_time"], columnKey: ["_field"], valueColumn: "_value")
-      |> keep(columns: ["_time", "temperature", "humidity"])
-    '''
+        query_api = client.query_api()
 
-    result = query_api.query_data_frame(query)
+        query = f'''
+        from(bucket: "{bucket}")
+          |> range(
+              start: time(v: "{start_iso}"),
+              stop: time(v: "{end_iso}")
+          )
+          |> filter(fn: (r) =>
+              r["_field"] == "temperature" or
+              r["_field"] == "humidity"
+          )
+          |> pivot(
+              rowKey: ["_time"],
+              columnKey: ["_field"],
+              valueColumn: "_value"
+          )
+          |> keep(columns: [
+              "_time",
+              "temperature",
+              "humidity"
+          ])
+          |> sort(columns: ["_time"])
+        '''
+
+        result = query_api.query_data_frame(query)
 
     if isinstance(result, list):
-        df = pd.concat(result)
+        frames = [
+            frame for frame in result
+            if frame is not None and not frame.empty
+        ]
+
+        if not frames:
+            return pd.DataFrame()
+
+        df = pd.concat(frames, ignore_index=True)
     else:
         df = result
 
-    if df.empty:
-        return df
+    if df.empty or "_time" not in df.columns:
+        return pd.DataFrame()
 
-    df["_time"] = pd.to_datetime(df["_time"])
+    # Limpiar los datos
+    df["_time"] = pd.to_datetime(df["_time"], utc=True)
+
+    for col in ["temperature", "humidity"]:
+        if col not in df.columns:
+            df[col] = float("nan")
+
+        df[col] = pd.to_numeric(
+            df[col],
+            errors="coerce"
+        )
+
+    df = df.dropna(
+        subset=["temperature", "humidity"],
+        how="all"
+    )
+
     df = df.sort_values("_time")
 
     return df
 
-# ---------------------------
-# LOAD DATA
-# ---------------------------
-df = load_data(time_range)
 
 # ---------------------------
-# METRICS
+# SELECCIÓN TEMPORAL
+# ---------------------------
+ahora = datetime.now(timezone.utc)
+
+# El slider entrega (horas recientes, horas antiguas).
+# Ejemplo: (0, 24) significa las últimas 24 horas.
+horas_recientes, horas_antiguas = rango_horas
+
+fecha_inicio = ahora - timedelta(hours=horas_antiguas)
+fecha_fin = ahora - timedelta(hours=horas_recientes)
+
+if fecha_inicio >= fecha_fin:
+    st.warning(
+        "El intervalo seleccionado no es válido. "
+        "Selecciona un rango mayor que cero."
+    )
+    st.stop()
+
+start_iso = fecha_inicio.isoformat()
+end_iso = fecha_fin.isoformat()
+
+st.caption(
+    f"Periodo consultado: "
+    f"{fecha_inicio.strftime('%d/%m/%Y %H:%M UTC')} — "
+    f"{fecha_fin.strftime('%d/%m/%Y %H:%M UTC')}"
+)
+
+df = load_data(start_iso, end_iso)
+
+
+# ---------------------------
+# MÉTRICAS
 # ---------------------------
 if not df.empty:
+
     col1, col2, col3, col4 = st.columns(4)
 
-    col1.metric("🌡️ Temp actual", f"{df['temperature'].iloc[-1]:.2f} °C")
-    col2.metric("💧 Humedad actual", f"{df['humidity'].iloc[-1]:.2f} %")
-    col3.metric("📊 Temp promedio", f"{df['temperature'].mean():.2f} °C")
-    col4.metric("📊 Humedad promedio", f"{df['humidity'].mean():.2f} %")
+    temperatura_actual = df["temperature"].dropna()
+    humedad_actual = df["humidity"].dropna()
 
-# ---------------------------
-# CHARTS
-# ---------------------------
-if not df.empty:
-
-    st.subheader("📈 Serie de tiempo")
-
-    fig = px.line(
-        df,
-        x="_time",
-        y=["temperature", "humidity"],
-        title="Temperature & Humidity"
+    col1.metric(
+        "🌡️ Última temperatura",
+        f"{temperatura_actual.iloc[-1]:.2f} °C"
+        if not temperatura_actual.empty else "N/D"
     )
 
-    st.plotly_chart(fig, use_container_width=True)
+    col2.metric(
+        "💧 Última humedad",
+        f"{humedad_actual.iloc[-1]:.2f} %"
+        if not humedad_actual.empty else "N/D"
+    )
+
+    col3.metric(
+        "📊 Temperatura promedio",
+        f"{temperatura_actual.mean():.2f} °C"
+        if not temperatura_actual.empty else "N/D"
+    )
+
+    col4.metric(
+        "📊 Humedad promedio",
+        f"{humedad_actual.mean():.2f} %"
+        if not humedad_actual.empty else "N/D"
+    )
+
+    st.divider()
 
     # ---------------------------
-    # RESAMPLING
+    # AGRUPACIÓN TEMPORAL
     # ---------------------------
-    st.subheader("⏱️ Promedio cada 10 minutos")
-
-    #df_resampled = df.set_index("_time").resample("10min").mean().dropna()
-    # Asegurar tipos numéricos
-    df["temperature"] = pd.to_numeric(df["temperature"], errors="coerce")
-    df["humidity"] = pd.to_numeric(df["humidity"], errors="coerce")
-    
-    # Asegurar datetime index
-    df["_time"] = pd.to_datetime(df["_time"])
-    
-    # Resample SOLO columnas numéricas
-    df_resampled = (
+    df_grafica = (
         df.set_index("_time")[["temperature", "humidity"]]
-        .resample("10min")
+        .resample(intervalos[resolucion])
         .mean()
-        .dropna()
+        .dropna(how="all")
+        .reset_index()
     )
 
-    fig2 = px.line(
-        df_resampled,
-        x=df_resampled.index,
-        y=["temperature", "humidity"],
-        title="Smoothed Data (10min avg)"
+    # ---------------------------
+    # GRÁFICA DE TEMPERATURA
+    # ---------------------------
+    st.subheader("🌡️ Temperatura por intervalo")
+
+    fig_temp = px.bar(
+        df_grafica,
+        x="_time",
+        y="temperature",
+        title=f"Temperatura promedio — {resolucion}",
+        labels={
+            "_time": "Fecha y hora",
+            "temperature": "Temperatura (°C)"
+        },
+        color_discrete_sequence=["#EF553B"]
     )
 
-    st.plotly_chart(fig2, use_container_width=True)
+    fig_temp.update_layout(
+        xaxis_title="Fecha y hora",
+        yaxis_title="Temperatura (°C)",
+        hovermode="x unified"
+    )
+
+    st.plotly_chart(
+        fig_temp,
+        use_container_width=True
+    )
 
     # ---------------------------
-    # RAW DATA
+    # GRÁFICA DE HUMEDAD
     # ---------------------------
-    st.subheader("📋 Datos crudos")
-    st.dataframe(df.tail(50))
+    st.subheader("💧 Humedad por intervalo")
+
+    fig_hum = px.bar(
+        df_grafica,
+        x="_time",
+        y="humidity",
+        title=f"Humedad promedio — {resolucion}",
+        labels={
+            "_time": "Fecha y hora",
+            "humidity": "Humedad (%)"
+        },
+        color_discrete_sequence=["#00CC96"]
+    )
+
+    fig_hum.update_layout(
+        xaxis_title="Fecha y hora",
+        yaxis_title="Humedad (%)",
+        hovermode="x unified"
+    )
+
+    st.plotly_chart(
+        fig_hum,
+        use_container_width=True
+    )
+
+    # ---------------------------
+    # TABLA DE PROMEDIOS
+    # ---------------------------
+    st.subheader("⏱️ Datos agrupados")
+
+    df_tabla = df_grafica.copy()
+    df_tabla["_time"] = (
+        df_tabla["_time"]
+        .dt.strftime("%Y-%m-%d %H:%M UTC")
+    )
+
+    st.dataframe(
+        df_tabla.rename(columns={
+            "_time": "Fecha y hora",
+            "temperature": "Temperatura (°C)",
+            "humidity": "Humedad (%)"
+        }),
+        use_container_width=True,
+        hide_index=True
+    )
+
+    # ---------------------------
+    # DATOS CRUDOS
+    # ---------------------------
+    with st.expander("📋 Ver datos crudos"):
+        st.dataframe(
+            df.sort_values("_time", ascending=False).head(500),
+            use_container_width=True,
+            hide_index=True
+        )
 
 else:
-    st.warning("No hay datos disponibles en este rango de tiempo")
+    st.warning(
+        "No hay datos disponibles para el intervalo seleccionado."
+    )
 
 # ---------------------------
 # AUTO REFRESH
 # ---------------------------
 if refresh > 0:
+    import time
+    time.sleep(refresh)
     st.rerun()
