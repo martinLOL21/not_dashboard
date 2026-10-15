@@ -9,9 +9,7 @@ from datetime import datetime, timedelta, timezone
 # CONFIGURACIÓN
 # ---------------------------
 url = "https://us-east-1-1.aws.cloud2.influxdata.com"
-
-# Recomendado: guardar las credenciales en .streamlit/secrets.toml
-token = st.secrets["influxdb"]["token"]
+token = "5FESPQw5t4qA4GgZmyeZ9mu7u1sbtauo4Hh8tjRi1E8sdrIgzXAX5ESk4n5MmcpAjJWEGgEKklFX0LNasnUmng=="
 org = "miguelcmo"
 bucket = "iot_telemetry_data"
 
